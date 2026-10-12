@@ -1,0 +1,23 @@
+[Unit]
+Description=Forward the journals of systemd-journal-remote to rsyslog in arrival order
+Documentation=file:///usr/local/share/doc/journald-remote-follower-rsyslog/README.md
+After=rsyslog.service systemd-journal-remote.socket
+Wants=rsyslog.service
+
+[Service]
+ExecStart=/usr/local/sbin/journald-remote-follower-rsyslog
+DynamicUser=yes
+# the journal files of systemd-journal-remote are readable by its group
+SupplementaryGroups=systemd-journal-remote
+StateDirectory=journald-remote-follower-rsyslog
+Restart=always
+RestartSec=10s
+ProtectHome=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+NoNewPrivileges=yes
+
+[Install]
+WantedBy=multi-user.target

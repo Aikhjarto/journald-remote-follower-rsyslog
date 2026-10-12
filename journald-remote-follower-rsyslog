@@ -1,0 +1,348 @@
+#!/usr/bin/python3
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# journald-remote-follower-rsyslog - forward the journals of systemd-journal-remote to rsyslog
+#
+# Copyright (C) 2026 Thomas Wagner
+#
+# This program is free software; you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation; either version 2 of the License, or (at your option)
+# any later version.
+#
+# This program is distributed in the hope that it will be useful, but WITHOUT
+# ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or
+# FITNESS FOR A PARTICULAR PURPOSE.  See the GNU General Public License for
+# more details.
+
+"""Forward the journals of systemd-journal-remote to rsyslog, in arrival order.
+
+rsyslog's imjournal reads the local and the remote journals as one stream
+merged by time; entries that are uploaded late (a backlog after an outage, a
+batch after a reconnect) are older than what it has read from the local
+journal already, and are skipped.  This program reads only the remote
+journals, follows them in the order the entries were written, and sends every
+entry as an RFC 5424 message over RELP, so rsyslog acknowledges each one.
+The position (journal cursor) is saved only after the acknowledgement:
+delivery is at least once.
+
+In backfill mode (--since), it sends the entries of a time range that are
+missing from rsyslog's per-host files, without following and without state.
+"""
+
+import argparse
+import datetime
+import glob
+import os
+import signal
+import socket
+import sys
+import time
+
+from systemd import journal
+
+VERSION = "0.1"
+NILVALUE = "-"
+
+
+def log(msg):
+    print(msg, file=sys.stderr, flush=True)
+
+
+# --- entries -> RFC 5424 ---------------------------------------------------
+
+def _str(value):
+    """A journal field as text: the first value if repeated, bytes decoded."""
+    if isinstance(value, list):
+        value = value[0] if value else ""
+    if isinstance(value, bytes):
+        value = value.decode("utf-8", errors="replace")
+    return str(value)
+
+
+def _int(value, default):
+    try:
+        return int(_str(value))
+    except ValueError:
+        return default
+
+
+def _token(value, maxlen):
+    """An RFC 5424 header field: printable US-ASCII without spaces."""
+    text = "".join(c if 33 <= ord(c) <= 126 else "_" for c in _str(value))
+    return text[:maxlen] or NILVALUE
+
+
+def short_host(entry):
+    return _token(_str(entry.get("_HOSTNAME", "")).split(".")[0], 255)
+
+
+def timestamp(entry):
+    """__REALTIME_TIMESTAMP in local time, as imjournal uses it."""
+    return entry["__REALTIME_TIMESTAMP"].astimezone().isoformat(timespec="microseconds")
+
+
+def to_syslog(entry):
+    facility = _int(entry.get("SYSLOG_FACILITY", 1), 1) & 0x7F
+    severity = _int(entry.get("PRIORITY", 5), 5) & 0x07
+    app = entry.get("SYSLOG_IDENTIFIER") or entry.get("_COMM") or NILVALUE
+    pid = entry.get("SYSLOG_PID") or entry.get("_PID") or NILVALUE
+    message = _str(entry.get("MESSAGE", ""))
+    header = "<%d>1 %s %s %s %s - -" % (
+        facility * 8 + severity, timestamp(entry), short_host(entry),
+        _token(app, 48), _token(pid, 128))
+    return (header + " " + message).encode("utf-8", errors="replace")
+
+
+# --- RELP client -------------------------------------------------------------
+
+class RelpError(Exception):
+    pass
+
+
+class Relp:
+    """A minimal RELP client: open, syslog (pipelined), close."""
+
+    def __init__(self, host, port, timeout=60):
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.rfile = self.sock.makefile("rb")
+        self.txnr = 0
+        offers = b"relp_version=0\nrelp_software=journald-remote-follower-rsyslog," + VERSION.encode() + b"\ncommands=syslog"
+        self._send([self._frame(b"open", offers)])
+        self._expect(1)
+
+    def _frame(self, command, data):
+        self.txnr = self.txnr % 999999999 + 1
+        head = b"%d %s %d" % (self.txnr, command, len(data))
+        return head + (b" " + data if data else b"") + b"\n"
+
+    def _send(self, frames):
+        self.sock.sendall(b"".join(frames))
+
+    def _read_until_space(self):
+        out = b""
+        while True:
+            c = self.rfile.read(1)
+            if not c:
+                raise RelpError("connection closed by rsyslog")
+            if c in b" \n":
+                return out, c
+            out += c
+
+    def _response(self):
+        txnr, _ = self._read_until_space()
+        command, _ = self._read_until_space()
+        length, sep = self._read_until_space()
+        data = b""
+        if int(length) > 0:
+            data = self.rfile.read(int(length))
+            sep = self.rfile.read(1)
+        elif sep == b" ":
+            sep = self.rfile.read(1)
+        if sep != b"\n":
+            raise RelpError("bad RELP frame")
+        if command == b"serverclose":
+            raise RelpError("rsyslog closed the session")
+        if command != b"rsp":
+            raise RelpError("unexpected RELP command %r" % command)
+        return int(txnr), data
+
+    def _expect(self, count):
+        for _ in range(count):
+            _, data = self._response()
+            if not data.startswith(b"200"):
+                raise RelpError("rsyslog refused: %s" % data.decode(errors="replace"))
+
+    def send(self, messages):
+        """Send the messages and return once rsyslog acknowledged all."""
+        self._send([self._frame(b"syslog", m) for m in messages])
+        self._expect(len(messages))
+
+    def close(self):
+        try:
+            self._send([self._frame(b"close", b"")])
+            self._expect(1)
+        except (OSError, RelpError):
+            pass
+        self.sock.close()
+
+
+# --- state -------------------------------------------------------------------
+
+def load_cursor(path):
+    try:
+        with open(path) as f:
+            return f.read().strip() or None
+    except FileNotFoundError:
+        return None
+
+
+def save_cursor(path, cursor):
+    tmp = path + ".tmp"
+    with open(tmp, "w") as f:
+        f.write(cursor + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, path)
+
+
+# --- follow mode -------------------------------------------------------------
+
+class Stop(Exception):
+    pass
+
+
+def position(reader, cursor, start):
+    """Seek to just after cursor, or to start (head/tail) without one."""
+    if cursor:
+        reader.seek_cursor(cursor)
+        entry = reader.get_next()
+        if entry and not reader.test_cursor(cursor):
+            reader.get_previous()       # the entry was vacuumed: start at the next one
+        return
+    if start == "head":
+        reader.seek_head()
+    else:
+        reader.seek_tail()
+        reader.get_previous()
+
+
+def follow(args):
+    stop = []
+    signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
+    signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+
+    reader = journal.Reader(path=args.directory)
+    cursor = load_cursor(args.state)
+    position(reader, cursor, args.start)
+    log("following %s from %s" % (args.directory, "the saved cursor" if cursor else args.start))
+
+    relp, delay, sent = None, 1, 0
+    while not stop:
+        batch = []
+        while len(batch) < args.batch:
+            entry = reader.get_next()
+            if not entry:
+                break
+            batch.append(entry)
+        if not batch:
+            reader.wait(5000000)
+            continue
+        try:
+            if relp is None:
+                relp = Relp(args.host, args.port)
+                delay = 1
+            relp.send([to_syslog(e) for e in batch])
+        except (OSError, RelpError) as err:
+            log("sending to %s:%d failed: %s; retrying in %ds" % (args.host, args.port, err, delay))
+            if relp:
+                relp.sock.close()
+            relp = None
+            position(reader, cursor, args.start)    # resend what was not acknowledged
+            for _ in range(delay):
+                if stop:
+                    break
+                time.sleep(1)
+            delay = min(delay * 2, 300)
+            continue
+        cursor = batch[-1]["__CURSOR"]
+        save_cursor(args.state, cursor)
+        sent += len(batch)
+    if relp:
+        relp.close()
+    log("stopped after %d entries" % sent)
+
+
+# --- backfill mode -----------------------------------------------------------
+
+def file_keys(hosts_dir, host, cache):
+    """The (timestamp, program) of the lines in the host's files."""
+    if host not in cache:
+        keys = set()
+        for path in glob.glob(os.path.join(hosts_dir, host, "messages*")):
+            if path.endswith((".gz", ".xz", ".zst")):
+                continue
+            with open(path, encoding="utf-8", errors="replace") as f:
+                for line in f:
+                    parts = line.split(" ", 3)
+                    if len(parts) >= 3:
+                        keys.add((parts[0], parts[2].split("[")[0].rstrip(":")))
+        cache[host] = keys
+    return cache[host]
+
+
+def backfill(args):
+    # Each file is read on its own, in the order its entries were written:
+    # merged by time, entries that were uploaded late would be skipped here
+    # as well.  So there is no seeking to --since; every file is read whole.
+    files = sorted(f for d in args.directory_list for f in glob.glob(os.path.join(d, "*.journal")))
+    cache, todo, total, missing = {}, [], 0, 0
+    relp = None if args.dry_run else Relp(args.host, args.port)
+    for path in files:
+        reader = journal.Reader(files=[path])
+        for entry in reader:
+            if not args.since <= entry["__REALTIME_TIMESTAMP"].astimezone() < args.until:
+                continue
+            total += 1
+            host = short_host(entry)
+            app = _token(entry.get("SYSLOG_IDENTIFIER") or entry.get("_COMM") or NILVALUE, 48)
+            if (timestamp(entry), app) in file_keys(args.hosts_dir, host, cache):
+                continue
+            missing += 1
+            if not args.dry_run:
+                todo.append(to_syslog(entry))
+                if len(todo) >= args.batch:
+                    relp.send(todo)
+                    todo = []
+        reader.close()
+    if todo:
+        relp.send(todo)
+    if relp:
+        relp.close()
+    log("%d entries in the range, %d missing from %s%s" % (
+        total, missing, args.hosts_dir, " (dry run, nothing sent)" if args.dry_run else ", sent"))
+
+
+# --- main ----------------------------------------------------------------------
+
+def parse_time(text):
+    return datetime.datetime.fromisoformat(text).astimezone()
+
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
+    p.add_argument("-D", "--directory", action="append", dest="directory_list", metavar="DIR",
+                   help="journal directory (default /var/log/journal/remote; "
+                        "backfill may take several)")
+    p.add_argument("--target", default="127.0.0.1:2514", metavar="HOST:PORT",
+                   help="rsyslog's imrelp input (default 127.0.0.1:2514)")
+    p.add_argument("--state", default="/var/lib/journald-remote-follower-rsyslog/cursor",
+                   help="cursor file for follow mode (default %(default)s)")
+    p.add_argument("--start", choices=("tail", "head"), default="tail",
+                   help="where to start without a saved cursor (default tail: new entries only)")
+    p.add_argument("--batch", type=int, default=500, help="entries per RELP batch")
+    p.add_argument("--since", type=parse_time, metavar="TIME",
+                   help="backfill: send the entries from TIME (ISO 8601) that are missing from --hosts-dir")
+    p.add_argument("--until", type=parse_time, metavar="TIME", help="backfill: up to TIME (default now)")
+    p.add_argument("--hosts-dir", default="/var/log/hosts",
+                   help="backfill: rsyslog's per-host files, <dir>/<host>/messages* (default %(default)s)")
+    p.add_argument("-n", "--dry-run", action="store_true", help="backfill: only count")
+    p.add_argument("--version", action="version", version="%(prog)s " + VERSION)
+    args = p.parse_args()
+
+    args.directory_list = args.directory_list or ["/var/log/journal/remote"]
+    args.directory = args.directory_list[0]
+    host, _, port = args.target.rpartition(":")
+    args.host, args.port = host.strip("[]"), int(port)
+
+    if args.since:
+        args.until = args.until or datetime.datetime.now().astimezone()
+        backfill(args)
+    else:
+        if len(args.directory_list) > 1:
+            p.error("follow mode reads one directory")
+        follow(args)
+
+
+if __name__ == "__main__":
+    main()
